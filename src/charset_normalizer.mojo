@@ -1,6 +1,5 @@
 """Byte and Unicode scoring kernels for charset detection."""
 
-from std.algorithm import parallelize
 from std.sys.info import simd_width_of
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
@@ -8,7 +7,6 @@ comptime U32Ptr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
 comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BYTE_W = simd_width_of[DType.uint8]()
-comptime RAW_WORKERS = 4
 comptime RAW_PARALLEL_THRESHOLD = 32 * 1024 * 1024
 
 
@@ -328,21 +326,7 @@ def mcn_text_scan(
         return 0
 
     var src = BPtr(unsafe_from_address=src_addr)
-    if n >= RAW_PARALLEL_THRESHOLD:
-        var scratch = I64Ptr(unsafe_from_address=scratch_addr)
-
-        @parameter
-        def scan_chunk(worker: Int):
-            var start = n * worker // RAW_WORKERS
-            var end = n * (worker + 1) // RAW_WORKERS
-            raw_stats(src + start, end - start, scratch + worker * 8)
-
-        parallelize[scan_chunk](RAW_WORKERS, RAW_WORKERS)
-        for worker in range(RAW_WORKERS):
-            for j in range(8):
-                raw[j] += scratch[worker * 8 + j]
-    else:
-        raw_stats(src, n, raw)
+    raw_stats(src, n, raw)
     if raw[1] == 0:
         utf8[0] = Int64(n)
         return n
