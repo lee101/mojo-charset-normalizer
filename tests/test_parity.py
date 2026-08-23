@@ -103,6 +103,23 @@ def test_large_utf8_sample_path_decodes_lazily():
     assert str(match) == text
 
 
+def test_legacy_sampling_handles_multibyte_window_boundaries():
+    text = JAPANESE * 200
+    match = mojo.from_bytes(
+        text.encode("shift_jis"), steps=3, chunk_size=7
+    ).best()
+    assert match.encoding == "cp932"
+    assert str(match) == text
+
+
+def test_large_single_byte_match_decodes_lazily():
+    text = RUSSIAN * 200
+    match = mojo.from_bytes(text.encode("cp1251")).best()
+    assert match.encoding == "cp1251"
+    assert match._string is None
+    assert str(match) == text
+
+
 def test_detect_legacy_api_matches_upstream():
     assert mojo.detect(ENGLISH.encode()) == upstream.detect(ENGLISH.encode())
     binary = bytes(range(256)) * 4

@@ -24,6 +24,8 @@ class CharsetMatch:
         languages: list[tuple[str, float]],
         decoded_payload: str | None = None,
         preemptive_declaration: str | None = None,
+        equivalence_sample: str | None = None,
+        decoded_length_hint: int | None = None,
     ):
         self._payload = payload
         self._encoding = iana_name(guessed_encoding)
@@ -32,6 +34,8 @@ class CharsetMatch:
         self._has_sig_or_bom = has_sig_or_bom
         self._string = decoded_payload
         self._preemptive_declaration = preemptive_declaration
+        self._equivalence_sample = equivalence_sample
+        self._decoded_length_hint = decoded_length_hint
         self._leaves: list[CharsetMatch] = []
         self._unicode_ranges: list[str] | None = None
         self._output_payload: bytes | None = None
@@ -140,7 +144,11 @@ class CharsetMatch:
 
     @property
     def multi_byte_usage(self) -> float:
-        return 0.0 if not self.raw else 1.0 - len(str(self)) / len(self.raw)
+        if not self.raw:
+            return 0.0
+        if self._decoded_length_hint is not None:
+            return 1.0 - self._decoded_length_hint / len(self.raw)
+        return 1.0 - len(str(self)) / len(self.raw)
 
     @property
     def alphabets(self) -> list[str]:
@@ -220,7 +228,14 @@ class CharsetMatches:
         if not isinstance(item, CharsetMatch):
             raise ValueError(f"Cannot append instance '{item.__class__}' to CharsetMatches")
         for match in self._results:
-            if match.fingerprint == item.fingerprint and match.chaos == item.chaos:
+            if (
+                match._equivalence_sample is not None
+                and item._equivalence_sample is not None
+                and match._equivalence_sample != item._equivalence_sample
+            ):
+                continue
+            equivalent = match.fingerprint == item.fingerprint
+            if equivalent and match.chaos == item.chaos:
                 match.add_submatch(item)
                 return
         self._results.append(item)

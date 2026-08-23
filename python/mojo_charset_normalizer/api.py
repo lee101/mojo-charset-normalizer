@@ -29,6 +29,14 @@ _CANDIDATES = (
     "gb18030", "gbk", "big5", "euc_kr",
 )
 _SINGLE_BYTE_ENCODINGS = frozenset(_CANDIDATES[:18])
+_UNDEFINED_BYTES = {
+    encoding: tuple(
+        value
+        for value in range(256)
+        if not bytes((value,)).decode(encoding, "ignore")
+    )
+    for encoding in _SINGLE_BYTE_ENCODINGS
+}
 
 _TARGET_SCRIPT = {
     "cp1251": 8, "koi8_r": 8, "iso8859_5": 8, "mac_cyrillic": 8,
@@ -104,6 +112,38 @@ def _sample_bytes(
         ]
         for index in range(steps)
     )
+
+
+def _sample_code_units(
+    payload: bytes | bytearray, steps: int, chunk_size: int, unit_size: int
+) -> bytes | bytearray:
+    width = max(1, chunk_size) * unit_size
+    if steps <= 1 or len(payload) <= max(1, steps) * width:
+        return payload
+    last = max(0, len(payload) - width)
+    last -= last % unit_size
+    chunks: list[bytes | bytearray] = []
+    for index in range(max(1, steps)):
+        start = (last * index) // (steps - 1)
+        start -= start % unit_size
+        chunks.append(payload[start:start + width])
+    return b"".join(chunks)
+
+
+def _sample_multibyte(
+    payload: bytes | bytearray, encoding: str, steps: int, chunk_size: int
+) -> str:
+    width = max(1, chunk_size) * 4
+    if steps <= 1 or len(payload) <= max(1, steps) * width:
+        return payload.decode(encoding, "strict")
+    last = max(0, len(payload) - width)
+    chunks: list[str] = []
+    for index in range(max(1, steps)):
+        start = (last * index) // (steps - 1)
+        chunks.append(
+            payload[start:start + width].decode(encoding, "ignore")[:chunk_size]
+        )
+    return "".join(chunks)
 
 
 def _sample_utf8(payload: bytes | bytearray, steps: int, chunk_size: int) -> str:
@@ -295,9 +335,10 @@ def _bomless_unicode_match(
     declared: str | None,
     steps: int,
     chunk_size: int,
+    nul_count: int,
 ) -> CharsetMatches:
     candidates: list[str] = []
-    pattern = _pattern_encoding(payload)
+    pattern = _pattern_encoding(payload) if nul_count else None
     if pattern:
         candidates.append(pattern)
     if len(payload) >= 8 and len(payload) % 4 == 0:
@@ -305,16 +346,18 @@ def _bomless_unicode_match(
     if len(payload) >= 4 and len(payload) % 2 == 0:
         candidates.extend(("utf_16_le", "utf_16_be"))
 
-    nul_ratio = payload.count(b"\x00") / len(payload)
-    ranked: list[tuple[float, float, str, str, list[tuple[str, float]]]] = []
+    nul_ratio = nul_count / len(payload)
+    ranked: list[tuple[float, float, str, list[tuple[str, float]]]] = []
     for encoding in dict.fromkeys(candidates):
         if encoding.startswith("utf_32") and nul_ratio < 0.35:
             continue
+        unit_size = 4 if encoding.startswith("utf_32") else 2
         try:
-            text = payload.decode(encoding, "strict")
+            sample = _sample_code_units(payload, steps, chunk_size, unit_size).decode(
+                encoding, "strict"
+            )
         except UnicodeDecodeError:
             continue
-        sample = _sample_text(text, steps, chunk_size)
         stats = codepoint_statistics(sample)
         total = max(1, int(stats[0]))
         recognized = (
@@ -334,11 +377,15 @@ def _bomless_unicode_match(
             continue
         if cjk and not int(stats[13] + stats[14]):
             chaos += 0.2 * max(0, cjk - common) / cjk
-        ranked.append((chaos, -recognized, encoding, text, languages))
+        ranked.append((chaos, -recognized, encoding, languages))
     if not ranked:
         return CharsetMatches()
-    chaos, _, encoding, text, languages = min(ranked)
+    chaos, _, encoding, languages = min(ranked)
     if chaos >= threshold:
+        return CharsetMatches()
+    try:
+        text = payload.decode(encoding, "strict")
+    except UnicodeDecodeError:
         return CharsetMatches()
     return CharsetMatches(
         [CharsetMatch(payload, encoding, chaos, False, languages, text, declared)]
@@ -399,7 +446,7 @@ def from_bytes(
         return CharsetMatches()
 
     unicode_match = _bomless_unicode_match(
-        sequences, threshold, declared, steps, chunk_size
+        sequences, threshold, declared, steps, chunk_size, int(raw_stats[2])
     )
     if unicode_match and allowed(unicode_match.best().encoding):
         return unicode_match
@@ -435,14 +482,17 @@ def from_bytes(
                 continue
             chaos, languages = _score(sample, canonical)
             text = None
+            decoded_length_hint = len(sequences)
         else:
             try:
-                text = sequences.decode(canonical, "strict")
+                sample = _sample_multibyte(
+                    sequences, canonical, steps, chunk_size
+                )
             except (LookupError, UnicodeDecodeError):
                 continue
-            chaos, languages = _score(
-                _sample_text(text, steps, chunk_size), canonical
-            )
+            chaos, languages = _score(sample, canonical)
+            text = None
+            decoded_length_hint = None
         if (
             canonical not in {"cp932", "shift_jis", "euc_jp", "euc_jis_2004",
                               "gb18030", "gbk", "big5", "euc_kr"}
@@ -454,12 +504,31 @@ def from_bytes(
         if chaos >= threshold:
             continue
         if text is None:
-            try:
-                text = sequences.decode(canonical, "strict")
-            except UnicodeDecodeError:
-                continue
+            if canonical in _SINGLE_BYTE_ENCODINGS:
+                if any(
+                    sequences.find(bytes((value,))) >= 0
+                    for value in _UNDEFINED_BYTES[canonical]
+                ):
+                    continue
+            else:
+                try:
+                    validated = sequences.decode(canonical, "strict")
+                except UnicodeDecodeError:
+                    continue
+                decoded_length_hint = len(validated)
+                text = validated
         results.append(
-            CharsetMatch(sequences, canonical, chaos, False, languages, text, declared)
+            CharsetMatch(
+                sequences,
+                canonical,
+                chaos,
+                False,
+                languages,
+                text,
+                declared,
+                sample,
+                decoded_length_hint,
+            )
         )
         if explain:
             logger.info("%s passed with chaos %.3f", canonical, chaos)

@@ -68,19 +68,20 @@ are the best of five runs on identical payloads.
 
 | case | Mojo port | upstream | speedup |
 | --- | ---: | ---: | ---: |
-| ASCII detection, 8 MB | 7.00 ms | 24.72 ms | 3.53x |
-| UTF-8 detection, 8 MB | 11.54 ms | 21.46 ms | 1.86x |
-| CP1251 detection, 2 MB | 23.85 ms | 38.45 ms | 1.61x |
-| Shift-JIS detection, 2 MB | 60.01 ms | 75.98 ms | 1.27x |
-| binary classification, 8 MB | 8.56 ms | 27.60 ms | 3.22x |
+| ASCII detection, 8 MB | 5.66 ms | 21.21 ms | 3.75x |
+| UTF-8 detection, 8 MB | 8.44 ms | 21.27 ms | 2.52x |
+| CP1251 detection, 2 MB | 9.91 ms | 36.86 ms | 3.72x |
+| Shift-JIS detection, 2 MB | 45.48 ms | 75.68 ms | 1.66x |
+| binary classification, 8 MB | 5.30 ms | 19.44 ms | 3.67x |
 
 SIMD byte classification and structural UTF-8 validation accelerate the
 streaming scans, including scalar remainder handling. Raw classification uses
 multiple CPU workers only for substantially larger inputs; smaller inputs
 remain serial because launch overhead loses at benchmark sizes. Large valid
-UTF-8 payloads are scored
-from bounded samples and decoded lazily, while single-byte legacy candidates
-are sampled before allocating full decoded strings. Candidate fingerprints are
+UTF-8 payloads are scored from bounded samples and decoded lazily, while
+single-byte legacy candidates are sampled before allocating full decoded
+strings. Multibyte and BOM-less Unicode candidates are screened with bounded,
+boundary-aware windows before a full strict decode. Candidate fingerprints are
 cached instead of repeatedly hashing multi-megabyte strings.
 
 There is no GPU path. The large kernels are low-arithmetic-intensity streaming
