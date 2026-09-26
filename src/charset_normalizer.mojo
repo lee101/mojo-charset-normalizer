@@ -1,6 +1,5 @@
 """Byte and Unicode scoring kernels for charset detection."""
 
-from max.algorithm import sync_parallelize
 from std.sys.info import simd_width_of
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
@@ -330,13 +329,10 @@ def mcn_text_scan(
     if n >= RAW_PARALLEL_THRESHOLD:
         var scratch = I64Ptr(unsafe_from_address=scratch_addr)
 
-        @parameter
-        def scan_chunk(index: Int):
+        for index in range(4):
             var start = n * index // 4
             var end = n * (index + 1) // 4
             raw_stats(src + start, end - start, scratch + index * 8)
-
-        sync_parallelize[scan_chunk](4)
         for index in range(4):
             for j in range(8):
                 raw[j] += scratch[index * 8 + j]
