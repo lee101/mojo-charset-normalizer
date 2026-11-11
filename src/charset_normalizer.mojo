@@ -65,17 +65,38 @@ def mcn_utf8_stats(src_addr: Int, n: Int, stats_addr: Int) abi("C") -> Int:
 
 
 def ascii_prefix(src: BPtr, n: Int) -> Int:
+    # The 4-lane test is the important one: it runs the body only when four
+    # ASCII bytes remain, so a near-non-ASCII buffer is not re-scanned one
+    # scalar byte at a time. Scalar lanes stop at the first non-ASCII byte, so
+    # the vector body still only sees positions that are all ASCII.
     var c128 = SIMD[DType.uint8, BYTE_W](128)
     var i = 0
-    while i + BYTE_W <= n:
-        # `reduce_or` answers "any non-ASCII lane?" without materialising a
-        # select+reduce_add per vector.
-        if src.unsafe_load[width=BYTE_W](i).ge(c128).reduce_or():
-            break
-        i += BYTE_W
-    while i < n and src[i] < 128:
+    while i + 4 <= n:
+        if src.unsafe_load(i) >= 128 or src.unsafe_load(i + 1) >= 128:
+            return i
+        if src.unsafe_load(i + 2) >= 128 or src.unsafe_load(i + 3) >= 128:
+            return i + 2
+        i += 4
+        while i + BYTE_W <= n:
+            # `reduce_or` answers "any non-ASCII lane?" without materialising
+            # a select+reduce_add per vector.
+            if src.unsafe_load[width=BYTE_W](i).ge(c128).reduce_or():
+                return i
+            i += BYTE_W
+    while i < n and src.unsafe_load(i) < 128:
         i += 1
     return i
+
+
+def utf8_stats(src: BPtr, n: Int, stats: I64Ptr) -> Int:
+    # Original control flow. `ascii_prefix` shortens the common ASCII prefix;
+    # everything after it is the single validate+count pass, so statistics stay
+    # bit-identical to the pre-SIMD baseline.
+    var ascii_count = ascii_prefix(src, n)
+    if ascii_count == n:
+        stats[0] = Int64(n)
+        return n
+    return utf8_count(src, n, ascii_count, stats)
 
 
 def utf8_stats_scalar(src: BPtr, n: Int, stats: I64Ptr) -> Int:
@@ -152,15 +173,20 @@ def valid_utf8_byte(src: BPtr, i: Int) -> Bool:
     return valid_kind and continuation == required
 
 
-def utf8_stats(src: BPtr, n: Int, stats: I64Ptr) -> Int:
-    var ascii_count = ascii_prefix(src, n)
-    if ascii_count == n:
-        stats[0] = Int64(n)
-        return n
+def utf8_count(src: BPtr, n: Int, start: Int, stats: I64Ptr) -> Int:
+    """Single-pass validator+counter from `start`; vector counts, scalar tail.
 
+    Returns `n` when `src` is valid UTF-8 and publishes char, non-continuation
+    and high-byte totals in `stats`; otherwise delegates to the scalar
+    validator (recomputed from 0) so the fallback result is unchanged.
+    `start` is the end of the ASCII prefix; 0, BYTE_W or a multiple of four.
+    """
     var high_count: Int64 = 0
     var continuation_count: Int64 = 0
-    var i = 0
+    var i = start
+    # Lanes 0..2 cannot be checked with the shifted-vector rule (there is no
+    # previous vector), so walk them per byte. When the ASCII prefix already
+    # covers them the loop does nothing.
     while i < min(3, n):
         if not valid_utf8_byte(src, i):
             return utf8_stats_scalar(src, n, stats)
