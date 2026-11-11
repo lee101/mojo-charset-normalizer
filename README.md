@@ -63,16 +63,41 @@ the Mojo source is newer. A packaged deployment can point
 ## Performance
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30GHz,
-Linux 6.8.0-136-generic, Python 3.13.14, and `charset-normalizer` 3.4.9. Times
-are the best of five runs on identical payloads.
+Linux 6.8.0-147-generic, Python 3.13.14, and `charset-normalizer` 3.4.9. Times
+are the best of five runs on identical payloads; the "before" column is the
+previous revision measured on the same machine in the same session.
 
-| case | Mojo port | upstream | speedup |
-| --- | ---: | ---: | ---: |
-| ASCII detection, 8 MB | 5.66 ms | 21.21 ms | 3.75x |
-| UTF-8 detection, 8 MB | 8.44 ms | 21.27 ms | 2.52x |
-| CP1251 detection, 2 MB | 9.91 ms | 36.86 ms | 3.72x |
-| Shift-JIS detection, 2 MB | 45.48 ms | 75.68 ms | 1.66x |
-| binary classification, 8 MB | 5.30 ms | 19.44 ms | 3.67x |
+| case | Mojo port before | Mojo port after | upstream | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| ASCII detection, 8 MB | 5.79 ms | 4.50 ms | 19.73 ms | 4.38x |
+| UTF-8 detection, 8 MB | 8.42 ms | 7.11 ms | 19.54 ms | 2.75x |
+| CP1251 detection, 2 MB | 10.40 ms | 9.94 ms | 35.91 ms | 3.61x |
+| Shift-JIS detection, 2 MB | 44.66 ms | 43.45 ms | 73.15 ms | 1.68x |
+| binary classification, 8 MB | 5.32 ms | 4.30 ms | 18.07 ms | 4.20x |
+
+The serial-chain pass retires the byte-class and UTF-8 scans faster in three
+ways, all verified by `pixi run bench` at real caller sizes:
+
+- `raw_stats` keeps eight independent per-lane accumulators instead of doing
+  eight horizontal `reduce_add` per vector and a memory read-modify-write on the
+  output counters. The accumulators are 16-bit lanes flushed every 1024 vectors
+  (each lane then holds at most 1024 counts, so the deferred reduction cannot
+  wrap). This is the change behind the ASCII and binary rows.
+- `ascii_prefix` and the UTF-8 validator's "any bad lane" test now use
+  `reduce_or` directly rather than materialising a select-plus-`reduce_add`.
+- Loop-invariant SIMD constants are hoisted out of both scans, and the
+  byte-class scan uses one `cast` instead of a `select` per vector.
+
+The multi-accumulator rewrite changes the summation order of the byte-class
+counters. Those counters are integers, so the totals are still exact and the
+benchmark and parity results are bit-identical; a floating-point reduction of
+the same kind could differ in the last bits.
+
+Tested and rejected (measured slower or neutral, so not kept): manual 2x
+unrolling of the scans, 16-bit lane accumulators in the UTF-8 loop, and hoisting
+the `mcn_codepoint_stats` counters into locals (the compiler already registers
+them). `@parameter for` and `@unroll` are not available on the pinned compiler,
+so compile-time unrolling is not used.
 
 SIMD byte classification and structural UTF-8 validation accelerate the
 streaming scans, including scalar remainder handling. Raw classification uses

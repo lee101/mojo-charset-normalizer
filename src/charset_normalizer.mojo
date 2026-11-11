@@ -65,18 +65,12 @@ def mcn_utf8_stats(src_addr: Int, n: Int, stats_addr: Int) abi("C") -> Int:
 
 
 def ascii_prefix(src: BPtr, n: Int) -> Int:
+    var c128 = SIMD[DType.uint8, BYTE_W](128)
     var i = 0
     while i + BYTE_W <= n:
-        var chunk = src.unsafe_load[width=BYTE_W](i)
-        if (
-            chunk.ge(SIMD[DType.uint8, BYTE_W](128))
-            .select(
-                SIMD[DType.uint8, BYTE_W](1),
-                SIMD[DType.uint8, BYTE_W](0),
-            )
-            .reduce_add()
-            != 0
-        ):
+        # `reduce_or` answers "any non-ASCII lane?" without materialising a
+        # select+reduce_add per vector.
+        if src.unsafe_load[width=BYTE_W](i).ge(c128).reduce_or():
             break
         i += BYTE_W
     while i < n and src[i] < 128:
@@ -211,7 +205,9 @@ def utf8_stats(src: BPtr, n: Int, stats: I64Ptr) -> Int:
             | (previous.eq(cf4) & current.ge(c90))
         )
         var bad = continuation.ne(required) | valid_kind.eq(false_mask) | bad_special
-        if bad.select(one, zero).reduce_add() != 0:
+        # A whole vector is clean iff no lane is bad; `reduce_or` tests that
+        # directly and avoids the select+reduce_add the scalar counters need.
+        if bad.reduce_or():
             invalid = True
             break
         high_count += Int64(current.ge(c80).select(one, zero).reduce_add())
@@ -242,47 +238,89 @@ def utf8_stats(src: BPtr, n: Int, stats: I64Ptr) -> Int:
     return n
 
 
+comptime RAW_ACCUM_FLUSH = 1024  # blocks between 16-bit accumulator flushes
+
+
 def raw_stats(src: BPtr, n: Int, raw: I64Ptr):
     for j in range(8):
         raw[j] = 0
     var i = 0
     var zero = SIMD[DType.uint8, BYTE_W](0)
-    var one = SIMD[DType.uint8, BYTE_W](1)
+    var c9 = SIMD[DType.uint8, BYTE_W](9)
+    var c10 = SIMD[DType.uint8, BYTE_W](10)
+    var c12 = SIMD[DType.uint8, BYTE_W](12)
+    var c13 = SIMD[DType.uint8, BYTE_W](13)
+    var c32 = SIMD[DType.uint8, BYTE_W](32)
+    var c127 = SIMD[DType.uint8, BYTE_W](127)
+    var c128 = SIMD[DType.uint8, BYTE_W](128)
+    var c160 = SIMD[DType.uint8, BYTE_W](160)
+    # Eight independent per-lane 16-bit accumulators. Each lane holds at most
+    # FLUSH counts (FLUSH <= 65535), so the deferred `reduce_add` cannot wrap.
+    # Deferring the reduction removes eight horizontal reductions per vector and
+    # keeps the counters in registers instead of round-tripping through memory.
+    var zeros16 = SIMD[DType.uint16, BYTE_W](0)
+    var acc0 = zeros16
+    var acc1 = zeros16
+    var acc2 = zeros16
+    var acc3 = zeros16
+    var acc4 = zeros16
+    var acc5 = zeros16
+    var acc6 = zeros16
+    var acc7 = zeros16
+    var blocks = 0
     while i + BYTE_W <= n:
         var values = src.unsafe_load[width=BYTE_W](i)
-        var ascii = values.lt(SIMD[DType.uint8, BYTE_W](128))
-        var high = values.ge(SIMD[DType.uint8, BYTE_W](128))
-        var nul = values.eq(zero)
-        var control = (
-            values.lt(SIMD[DType.uint8, BYTE_W](32))
-            & values.ne(SIMD[DType.uint8, BYTE_W](9))
-            & values.ne(SIMD[DType.uint8, BYTE_W](10))
-            & values.ne(SIMD[DType.uint8, BYTE_W](12))
-            & values.ne(SIMD[DType.uint8, BYTE_W](13))
-        ) | values.eq(SIMD[DType.uint8, BYTE_W](127))
-        var whitespace = (
-            values.eq(SIMD[DType.uint8, BYTE_W](9))
-            | values.eq(SIMD[DType.uint8, BYTE_W](10))
-            | values.eq(SIMD[DType.uint8, BYTE_W](12))
-            | values.eq(SIMD[DType.uint8, BYTE_W](13))
-            | values.eq(SIMD[DType.uint8, BYTE_W](32))
-        )
-        var printable = values.ge(SIMD[DType.uint8, BYTE_W](32)) & values.lt(
-            SIMD[DType.uint8, BYTE_W](127)
-        )
-        var c1 = values.ge(SIMD[DType.uint8, BYTE_W](128)) & values.lt(
-            SIMD[DType.uint8, BYTE_W](160)
-        )
-        var newline = values.eq(SIMD[DType.uint8, BYTE_W](10))
-        raw[0] += Int64(ascii.select(one, zero).reduce_add())
-        raw[1] += Int64(high.select(one, zero).reduce_add())
-        raw[2] += Int64(nul.select(one, zero).reduce_add())
-        raw[3] += Int64(control.select(one, zero).reduce_add())
-        raw[4] += Int64(whitespace.select(one, zero).reduce_add())
-        raw[5] += Int64(printable.select(one, zero).reduce_add())
-        raw[6] += Int64(c1.select(one, zero).reduce_add())
-        raw[7] += Int64(newline.select(one, zero).reduce_add())
+        acc0 += values.lt(c128).cast[DType.uint16]()
+        acc1 += values.ge(c128).cast[DType.uint16]()
+        acc2 += values.eq(zero).cast[DType.uint16]()
+        acc3 += (
+            (
+                values.lt(c32)
+                & values.ne(c9)
+                & values.ne(c10)
+                & values.ne(c12)
+                & values.ne(c13)
+            )
+            | values.eq(c127)
+        ).cast[DType.uint16]()
+        acc4 += (
+            values.eq(c9)
+            | values.eq(c10)
+            | values.eq(c12)
+            | values.eq(c13)
+            | values.eq(c32)
+        ).cast[DType.uint16]()
+        acc5 += (values.ge(c32) & values.lt(c127)).cast[DType.uint16]()
+        acc6 += (values.ge(c128) & values.lt(c160)).cast[DType.uint16]()
+        acc7 += values.eq(c10).cast[DType.uint16]()
         i += BYTE_W
+        blocks += 1
+        if blocks >= RAW_ACCUM_FLUSH:
+            raw[0] += Int64(acc0.reduce_add())
+            raw[1] += Int64(acc1.reduce_add())
+            raw[2] += Int64(acc2.reduce_add())
+            raw[3] += Int64(acc3.reduce_add())
+            raw[4] += Int64(acc4.reduce_add())
+            raw[5] += Int64(acc5.reduce_add())
+            raw[6] += Int64(acc6.reduce_add())
+            raw[7] += Int64(acc7.reduce_add())
+            acc0 = zeros16
+            acc1 = zeros16
+            acc2 = zeros16
+            acc3 = zeros16
+            acc4 = zeros16
+            acc5 = zeros16
+            acc6 = zeros16
+            acc7 = zeros16
+            blocks = 0
+    raw[0] += Int64(acc0.reduce_add())
+    raw[1] += Int64(acc1.reduce_add())
+    raw[2] += Int64(acc2.reduce_add())
+    raw[3] += Int64(acc3.reduce_add())
+    raw[4] += Int64(acc4.reduce_add())
+    raw[5] += Int64(acc5.reduce_add())
+    raw[6] += Int64(acc6.reduce_add())
+    raw[7] += Int64(acc7.reduce_add())
     while i < n:
         var b = Int(src[i])
         if b < 128:
@@ -440,7 +478,9 @@ def mcn_codepoint_stats(src_addr: Int, n: Int, stats_addr: Int) abi("C") -> Int:
             stats[19] += 1
         if cp == 0xC2 or cp == 0xC3 or cp == 0xD0 or cp == 0xD1 or cp == 0xE2:
             stats[20] += 1
-        if cp >= 0xA0 and cp <= 0xBF and not is_latin_letter(cp):
+        # 0xA0..0xBF lies entirely below the Latin-letter range (0xC0..), so the
+        # old `and not is_latin_letter(cp)` guard was always true.
+        if cp >= 0xA0 and cp <= 0xBF:
             stats[21] += 1
 
         if script != 0:
