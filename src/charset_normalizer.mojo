@@ -67,7 +67,7 @@ def mcn_utf8_stats(src_addr: Int, n: Int, stats_addr: Int) abi("C") -> Int:
 def ascii_prefix(src: BPtr, n: Int) -> Int:
     var i = 0
     while i + BYTE_W <= n:
-        var chunk = src.load[width=BYTE_W](i)
+        var chunk = src.unsafe_load[width=BYTE_W](i)
         if (
             chunk.ge(SIMD[DType.uint8, BYTE_W](128))
             .select(
@@ -191,10 +191,10 @@ def utf8_stats(src: BPtr, n: Int, stats: I64Ptr) -> Int:
     var cf5 = SIMD[DType.uint8, BYTE_W](0xF5)
     var invalid = False
     while i + BYTE_W <= n:
-        var current = src.load[width=BYTE_W](i)
-        var previous = src.load[width=BYTE_W](i - 1)
-        var previous2 = src.load[width=BYTE_W](i - 2)
-        var previous3 = src.load[width=BYTE_W](i - 3)
+        var current = src.unsafe_load[width=BYTE_W](i)
+        var previous = src.unsafe_load[width=BYTE_W](i - 1)
+        var previous2 = src.unsafe_load[width=BYTE_W](i - 2)
+        var previous3 = src.unsafe_load[width=BYTE_W](i - 3)
         var continuation = current.ge(c80) & current.lt(cc2)
         var required = (
             (previous.ge(cc2) & previous.lt(cf5))
@@ -249,7 +249,7 @@ def raw_stats(src: BPtr, n: Int, raw: I64Ptr):
     var zero = SIMD[DType.uint8, BYTE_W](0)
     var one = SIMD[DType.uint8, BYTE_W](1)
     while i + BYTE_W <= n:
-        var values = src.load[width=BYTE_W](i)
+        var values = src.unsafe_load[width=BYTE_W](i)
         var ascii = values.lt(SIMD[DType.uint8, BYTE_W](128))
         var high = values.ge(SIMD[DType.uint8, BYTE_W](128))
         var nul = values.eq(zero)
