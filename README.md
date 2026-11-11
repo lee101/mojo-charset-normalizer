@@ -100,14 +100,74 @@ them). `@parameter for` and `@unroll` are not available on the pinned compiler,
 so compile-time unrolling is not used.
 
 SIMD byte classification and structural UTF-8 validation accelerate the
-streaming scans, including scalar remainder handling. Raw classification uses
-multiple CPU workers only for substantially larger inputs; smaller inputs
-remain serial because launch overhead loses at benchmark sizes. Large valid
-UTF-8 payloads are scored from bounded samples and decoded lazily, while
-single-byte legacy candidates are sampled before allocating full decoded
-strings. Multibyte and BOM-less Unicode candidates are screened with bounded,
-boundary-aware windows before a full strict decode. Candidate fingerprints are
-cached instead of repeatedly hashing multi-megabyte strings.
+streaming scans, including scalar remainder handling. Large valid UTF-8 payloads
+are scored from bounded samples and decoded lazily, while single-byte legacy
+candidates are sampled before allocating full decoded strings. Multibyte and
+BOM-less Unicode candidates are screened with bounded, boundary-aware windows
+before a full strict decode. Candidate fingerprints are cached instead of
+repeatedly hashing multi-megabyte strings.
+
+### Parallel raw scan: measured and rejected
+
+A parallel variant of the raw byte-class scan was built and benchmarked, then
+removed. It is not in the shipped library. `mcn_text_scan` makes one serial
+`raw_stats` pass at every size, and its `scratch` argument is accepted for ABI
+compatibility but not read.
+
+The variant split the buffer into 16 equal chunks and ran `raw_stats` on each
+chunk with `parallelize` from `max.algorithm` (worker counts 1, 2 and 4, never
+more than 4), merged the 8 counters per chunk afterwards, and kept the serial
+path below a size threshold.
+
+**Where it wins.** The gain appears only in one narrow step. At 32 MB the
+parallel path was about 3x faster than serial; below it, it was never faster.
+Numbers are the best of 13 kernel runs with the process pinned to four CPUs
+(`taskset -c 0-3`), milliseconds per call, ASCII payload:
+
+| input size | serial | 1 worker | 2 workers | 4 workers |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 MB | 5.3 | 4.4 | 4.4 | 4.4 |
+| 16 MB | 8.9 | 8.8 | 8.7 | 9.0 |
+| 24 MB | 13.9 | 13.8 | 13.8 | 13.7 |
+| 30 MB | 17.3 | 17.2 | 17.2 | 17.2 |
+| 32 MB | 18.9 | 18.5 | 11.2 | 6.0 |
+| 40 MB | 23.1 | 23.4 | 14.8 | 10.5 |
+| 64 MB | 38.6 | 37.7 | 23.3 | 13.5 |
+
+End to end through `from_bytes`, the same payload went from 19.5 ms serial
+around 32 MB to 6.5 ms with four workers, and from 39 ms to 12-13 ms at 64 MB.
+The worker scaling kept improving up to 4, so the cap was not the limit; more
+than 4 workers were never measured, because the rules here forbade it.
+
+The 32 MB step is where the parallel path switched on, not a CPU effect: the
+serial numbers are a straight line through that point (24 MB: 13.9 ms, 30 MB:
+17.3 ms, 32 MB: 18.9 ms), and splitting the scan into 4 or 16 chunks with no
+threads at all stayed neutral. On a shared host the cost of a parallel call
+scales with the number of CPUs the process can see (about 60 us per worker to
+launch), so without pinning a call costs about 4.5 ms of launch time and wins
+nothing below roughly 64 MB.
+
+**Why it was removed.** At 32 MB and above, the parallel path reproducibly
+killed the interpreter when the process exited: 4 of 4 runs through
+`text_statistics` at 32 MB and 3 of 3 `from_bytes` runs at 30-64 MB, while the
+serial build crashed in 0 of 8 runs on the same payloads. The crash is at
+interpreter shutdown, after every result had been computed and returned
+correctly (identical counters), as a segmentation fault in CPython's own GC
+(`_PyGCHead_NEXT(gc=0x0)` in `update_refs`, called from `Py_FinalizeEx`) or as
+a glibc `corrupted size vs. prev_size` abort in the
+`libKGENCompilerRTShared.so` atexit handler. A bare `ctypes` call to the same
+parallel kernel from a standalone script did not reproduce it, so the trigger
+needs the package's normal call path; that is exactly the path callers use, and
+a library that crashes the host process at exit is worse than no parallelism.
+
+The variant was reverted rather than shipped behind a higher threshold, because
+the crash covered every size where the parallel path could win, so raising the
+threshold would only have moved the same crash to larger inputs. The test suite
+keeps `test_text_scan_large_inputs_match_numpy`, which checks the serial scan at
+31 MB and just above 32 MB against numpy counts, so the boundary stays covered.
+`bench/ab.py` measures a 40 MB `mcn_text_scan` case, so re-testing a future
+variant takes one command. `parallelize` from `max.algorithm` does compile and
+run on this toolchain; the problem is the shutdown crash, not the import.
 
 There is no GPU path. The large kernels are low-arithmetic-intensity streaming
 byte scans, while Unicode scoring operates on small samples; device transfer

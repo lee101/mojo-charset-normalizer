@@ -15,7 +15,6 @@ LIB = os.environ.get("MOJO_CHARSET_NORMALIZER_LIB") or os.path.join(
     ROOT, "dist", "libmojo-charset-normalizer.so"
 )
 SOURCE = os.path.join(ROOT, "src", "charset_normalizer.mojo")
-RAW_PARALLEL_THRESHOLD = 32 * 1024 * 1024
 
 I = ctypes.c_int64
 _SIGNATURES = {
@@ -117,7 +116,8 @@ def text_statistics(
     data = _u8(payload)
     raw = np.empty(8, dtype=np.int64)
     utf8 = np.empty(3, dtype=np.int64)
-    scratch = np.empty(32, dtype=np.int64)
+    # Unused by the kernel (serial scan); must be non-NULL by contract.
+    scratch = np.zeros(1, dtype=np.int64)
     position = int(
         lib().mcn_text_scan(
             data.ctypes.data,

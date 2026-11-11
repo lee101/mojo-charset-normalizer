@@ -4,7 +4,6 @@ import pytest
 
 from mojo_charset_normalizer import byte_frequencies, entropy, is_valid_utf8
 from mojo_charset_normalizer._lib import (
-    RAW_PARALLEL_THRESHOLD,
     byte_statistics,
     codepoint_statistics,
     text_statistics,
@@ -92,28 +91,42 @@ def test_utf8_simd_boundaries_and_scalar_tails(prefix):
 
 
 @pytest.mark.parametrize(
-    "size", [RAW_PARALLEL_THRESHOLD - 1, RAW_PARALLEL_THRESHOLD + 17]
+    "size", [31 * 1024 * 1024, 32 * 1024 * 1024 + 17]
 )
-def test_text_scan_parallel_threshold_and_tail(size):
+def test_text_scan_large_inputs_match_numpy(size):
+    # 32 MB is where a parallel raw scan was once considered (and rejected:
+    # it crashed the host process at exit). The serial scan must stay correct
+    # on both sides of that size, so the reference is recomputed with numpy.
     pattern = b"A \n\x00\x1f\x80\xff"
     quotient, remainder = divmod(size, len(pattern))
     payload = pattern * quotient + pattern[:remainder]
-    counts = {
-        value: quotient + pattern[:remainder].count(value)
-        for value in set(pattern)
-    }
-    raw, _ = text_statistics(payload)
-    assert raw.tolist() == [
-        counts[ord("A")] + counts[ord(" ")] + counts[ord("\n")]
-        + counts[0] + counts[0x1F],
-        counts[0x80] + counts[0xFF],
-        counts[0],
-        counts[0] + counts[0x1F],
-        counts[ord(" ")] + counts[ord("\n")],
-        counts[ord("A")] + counts[ord(" ")],
-        counts[0x80],
-        counts[ord("\n")],
+    data = np.frombuffer(payload, dtype=np.uint8)
+    expected = [
+        int(np.count_nonzero(data < 128)),
+        int(np.count_nonzero(data >= 128)),
+        int(np.count_nonzero(data == 0)),
+        int(np.count_nonzero(((data < 32) & (data != 9) & (data != 10)
+                             & (data != 12) & (data != 13)) | (data == 127))),
+        int(np.count_nonzero((data == 9) | (data == 10) | (data == 12)
+                             | (data == 13) | (data == 32))),
+        int(np.count_nonzero((data >= 32) & (data < 127))),
+        int(np.count_nonzero((data >= 128) & (data < 160))),
+        int(np.count_nonzero(data == 10)),
     ]
+    raw, _ = text_statistics(payload)
+    assert raw.tolist() == expected
+
+
+def test_text_scan_serial_and_repeat_calls_agree():
+    # Same input, two calls: identical output, and identical to a plain
+    # Python byte count on a payload that exercises every counter.
+    payload = (b"line\n\t\x00\x7f\x80\xa0text " * 5000) + b"\xff" * 7
+    first, first_utf8 = text_statistics(payload)
+    second, second_utf8 = text_statistics(payload)
+    assert first.tolist() == second.tolist()
+    assert first_utf8 == second_utf8
+    assert first[0] + first[1] == len(payload)
+    assert first[5] == sum(32 <= b < 127 for b in payload)
 
 
 def test_codepoint_statistics_count_scripts():

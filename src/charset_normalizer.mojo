@@ -7,7 +7,6 @@ comptime U32Ptr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
 comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BYTE_W = simd_width_of[DType.uint8]()
-comptime RAW_PARALLEL_THRESHOLD = 32 * 1024 * 1024
 
 
 @export("mcn_byte_stats")
@@ -372,13 +371,7 @@ def raw_stats(src: BPtr, n: Int, raw: I64Ptr):
 def mcn_text_scan(
     src_addr: Int, n: Int, raw_addr: Int, utf8_addr: Int, scratch_addr: Int
 ) abi("C") -> Int:
-    if (
-        n < 0
-        or raw_addr == 0
-        or utf8_addr == 0
-        or (n > 0 and src_addr == 0)
-        or (n >= RAW_PARALLEL_THRESHOLD and scratch_addr == 0)
-    ):
+    if n < 0 or raw_addr == 0 or utf8_addr == 0 or (n > 0 and src_addr == 0):
         return -1
     var raw = I64Ptr(unsafe_from_address=raw_addr)
     var utf8 = I64Ptr(unsafe_from_address=utf8_addr)
@@ -390,18 +383,10 @@ def mcn_text_scan(
         return 0
 
     var src = BPtr(unsafe_from_address=src_addr)
-    if n >= RAW_PARALLEL_THRESHOLD:
-        var scratch = I64Ptr(unsafe_from_address=scratch_addr)
-
-        for index in range(4):
-            var start = n * index // 4
-            var end = n * (index + 1) // 4
-            raw_stats(src + start, end - start, scratch + index * 8)
-        for index in range(4):
-            for j in range(8):
-                raw[j] += scratch[index * 8 + j]
-    else:
-        raw_stats(src, n, raw)
+    # `scratch_addr` is accepted for ABI compatibility and is not read: the raw
+    # scan is one serial pass. The parallel variant measured here lost below
+    # 32 MB and crashed the host process at exit above it; see the README.
+    raw_stats(src, n, raw)
     if raw[1] == 0:
         utf8[0] = Int64(n)
         return n

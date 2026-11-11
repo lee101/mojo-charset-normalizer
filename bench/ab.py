@@ -81,6 +81,23 @@ def native_cases() -> list[tuple[str, object, tuple]]:
 
         cases.append((f"mcn_text_scan {name}", run, (raw, utf8)))
 
+    # Above 30 MB, where the rejected parallel raw scan was measured.
+    for name in ("ascii", "utf8"):
+        unit = data[name]
+        count = (40 << 20) // len(unit) + 1
+        big = np.frombuffer(unit * count, dtype=np.uint8)[: 40 << 20]
+        raw = np.empty(8, dtype=np.int64)
+        utf8 = np.empty(3, dtype=np.int64)
+        scratch = np.empty(1, dtype=np.int64)
+
+        def big_run(big=big, raw=raw, utf8=utf8, scratch=scratch):
+            native.mcn_text_scan(
+                big.ctypes.data, big.size, raw.ctypes.data, utf8.ctypes.data,
+                scratch.ctypes.data,
+            )
+
+        cases.append((f"mcn_text_scan {name}", big_run, (raw, utf8)))
+
     buf = np.frombuffer(data["utf8"], dtype=np.uint8)
     stats = np.empty(3, dtype=np.int64)
 
