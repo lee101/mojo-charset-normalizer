@@ -1,4 +1,6 @@
 import math
+import os
+
 import numpy as np
 import pytest
 
@@ -176,3 +178,26 @@ def test_input_buffer_is_pinned_for_native_call(monkeypatch):
 def test_native_helpers_reject_non_buffer_contract():
     with pytest.raises(TypeError):
         byte_frequencies("abc")
+
+
+def test_cpu_kernels_remain_the_only_path():
+    # A GPU path was built, measured, and reverted (see the README). The CPU
+    # exports must remain the shipped implementation, so a stray device export
+    # would mean a revert that did not fully land.
+    from mojo_charset_normalizer._lib import lib
+
+    native = lib()
+    for name in ("mcn_gpu_available", "mcn_text_scan_gpu", "mcn_codepoint_stats_gpu"):
+        assert not hasattr(native, name), f"{name} is present but the GPU path was reverted"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MOJO_CHARSET_EXPECT_GPU"),
+    reason="no GPU path is shipped; device parity tests are skipped",
+)
+def test_device_parity_when_present():  # pragma: no cover - skipped by default
+    # Placeholder for a future GPU attempt: this only runs when a build with
+    # the device exports is deliberately under test.
+    from mojo_charset_normalizer._lib import lib
+
+    assert lib().mcn_gpu_available() == 1

@@ -169,9 +169,100 @@ keeps `test_text_scan_large_inputs_match_numpy`, which checks the serial scan at
 variant takes one command. `parallelize` from `max.algorithm` does compile and
 run on this toolchain; the problem is the shutdown crash, not the import.
 
-There is no GPU path. The large kernels are low-arithmetic-intensity streaming
-byte scans, while Unicode scoring operates on small samples; device transfer
-and launch overhead would dominate both.
+### GPU path: measured and rejected
+
+There is no GPU path in the shipped library. A full device path for the two
+heaviest kernels was built, verified for exact output parity with the CPU
+kernels, measured at the sizes real callers pass, and then removed because it
+lost on every case at every size.
+
+**The gate.** A GPU only pays when a kernel does enough arithmetic per byte to
+hide the copy. `pixi run python bench/intensity.py` counts the vector
+operations in each hot loop and divides by the bytes one iteration consumes
+(`perf` counters are blocked on this host, `perf_event_paranoid=4`):
+
+| kernel | flops/byte | gate |
+| --- | ---: | --- |
+| `mcn_text_scan` (`raw_stats`, ASCII/binary) | 1.16 | CPU only: memory-bound |
+| `mcn_utf8_stats` (`utf8_count`, per vector) | 2.69 | candidate |
+| `mcn_codepoint_stats` (UTF-32LE input) | 18.50 | candidate |
+| `mcn_byte_stats` (serial histogram) | 3.00 | candidate |
+
+`simd_width_of[DType.uint8]()` is 32 on this compiler, and that is what decides
+the byte scan: 37 counted vector ops per 32-byte iteration is 1.16 flops per
+byte, under the bar. **CPU only: memory-bound** is therefore the correct
+disposition for `mcn_text_scan` itself, before any timing. The other three
+clear it, at 2.69 to 18.50, so they were the ones worth a device — and the
+measurement below is why none of them got one.
+
+**What was built.** `DeviceContext` from `max.gpu.host` with `block_idx` and
+`thread_idx` from `max.gpu` on `mojo ==1.2.0.dev2026092605`. Each kernel copies
+its input to the device once, runs a scan launch over the whole grid, folds the
+per-block partials with one small launch (no shared memory, no atomics), and
+copies results back once. The grid covers the whole input and the short final
+block is handled by a per-item bounds check, which was tested at every length
+from 0 to 40 bytes and at block boundaries. Counters are integers, so parity
+with the CPU is exact, not approximate: 0 mismatches over those tails, at
+64 KB and 65,537 bytes, and over 63 codepoint texts including script-transition
+cases. Device allocations stayed under 2 GB: the largest was the 64 MB payload
+plus 537 MB of per-thread partials.
+
+**The measurement.** Shared host, RTX 5090 with 5498 MiB free at the time
+(above the 4000 MiB gate), 72 CPUs, Linux 6.8.0-147-generic. Best of 7 runs,
+CPU best-of-many amortised. Milliseconds per call:
+
+| case | CPU | GPU | GPU vs CPU |
+| --- | ---: | ---: | --- |
+| `mcn_text_scan` ASCII 100 KB | 0.093 | 3.592 | 38.5x slower |
+| `mcn_text_scan` ASCII 1 MB | 0.865 | 36.239 | 41.9x slower |
+| `mcn_text_scan` ASCII 8 MB | 7.041 | 729.118 | 103.6x slower |
+| `mcn_text_scan` ASCII 32 MB | 28.308 | 3478.838 | 122.9x slower |
+| `mcn_text_scan` ASCII 64 MB | 56.807 | 7491.875 | 131.9x slower |
+| `mcn_text_scan` UTF-8 8 MB | 10.102 | 743.122 | 73.6x slower |
+| `mcn_text_scan` binary 8 MB | 6.873 | 936.897 | 136.3x slower |
+| `mcn_codepoint_stats` CP1251, 2560 chars | 0.039 | 2.394 | 61.1x slower |
+| `mcn_codepoint_stats` CP1251, 25,600 chars | 0.353 | 1.043 | 3.0x slower |
+| `mcn_codepoint_stats` CP1251, 256k chars | 3.470 | 9.518 | 2.7x slower |
+| `mcn_codepoint_stats` CP1251, 2.56M chars | 35.006 | 252.237 | 7.2x slower |
+| `mcn_codepoint_stats` Shift-JIS, 2560 chars | 0.045 | 0.211 | 4.7x slower |
+| `mcn_codepoint_stats` Shift-JIS, 256k chars | 4.015 | 9.531 | 2.4x slower |
+| `mcn_codepoint_stats` Latin, 2560 chars | 0.042 | 2.399 | 56.9x slower |
+| `mcn_codepoint_stats` Latin, 256k chars | 3.576 | 9.495 | 2.7x slower |
+
+The launch-plus-copy floor on this host measured about 125 us per call, so
+2,560 codepoints — the real default, `steps=5` and `chunk_size=512` — cannot
+pay for a device trip even in principle, and they lose by 5-60x. Larger
+codepoint samples (25,600 to 2.56M characters) still lose, because the scoring
+pass is a branch-heavy scalar walk per codepoint and the device runs it at a
+lower clock than the CPU, while a 2.56M-codepoint call also has to allocate
+491 MB of per-thread partials. `mcn_utf8_stats` was not given a device pass of
+its own: its `utf8_count` loop is a sequential validator with early exit, and
+`mcn_text_scan` already runs it, so it was measured as part of that call.
+
+The byte scan loses by a wider margin and the gap grows with size, which rules
+out the transfer as the cause: the device sustained only 9-29 GB/s against the
+CPU kernel's ~1.2 TB/s effective rate for an 8 MB payload. The device kernel
+walks one byte per thread per step, so the 8 MB payload needs 32,768 blocks
+(8.4M partial slots) where the CPU version does 16 bytes per vector instruction
+with eight register-resident accumulators. A device version that loads vectors and
+reduces them per block would narrow that, but it still has to beat a CPU pass
+that already runs at memory-copy speed, and it still has to copy the payload in
+and out.
+
+**Verdict.** Reverted. The device never won at a size any caller passes, and it
+won at no larger size either, so shipping it behind a size threshold would
+only have added an untested branch.
+
+**Tests skipped.** There is no GPU path, so the device tests skip rather than
+run: `pytest tests` reports `66 passed, 1 skipped`, and the single skip is
+`test_device_parity_when_present`, which requires `MOJO_CHARSET_EXPECT_GPU=1`
+and a build carrying the `*_gpu` exports. A companion test asserts those
+exports are absent, so a future attempt that forgets to revert cannot pass
+silently. The GPU comparison benchmark is skipped on this build too:
+`bench/gpu_ab.py` prints `GPU path not built: this library has no device
+exports. No GPU rows to measure; skipped.` with exit status 0, so it does not
+fail on a CPU-only host. `pixi run python bench/intensity.py` runs anywhere and
+needs no device.
 
 ## How it works
 
